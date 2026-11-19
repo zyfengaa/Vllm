@@ -20,6 +20,9 @@
 | 3a | [03a-核心机制-KV与调度.md](03a-核心机制-KV与调度.md) | PagedAttention → 可扩展 KV、调度器源码主干、前缀缓存 |
 | 3b | [03b-核心机制-执行与并行.md](03b-核心机制-执行与并行.md) | Attention 后端矩阵、CUDA Graph、torch.compile、采样、投机解码、TP/PP/DP/EP/CP |
 | 3c | [03c-核心机制-量化与服务化.md](03c-核心机制-量化与服务化.md) | 权重/KV 量化、P/D 分离、KV Offload 与 HiSparse、启动与权重加载 |
+| 3d | [03d-专题-FlashAttention演进.md](03d-专题-FlashAttention演进.md) | FlashAttention 1→4 代差异、与 paged KV 的结合、内核分工与兼容性坑 |
+| 3e | [03e-专题-KV池化与Mooncake.md](03e-专题-KV池化与Mooncake.md) | KV 池化、Mooncake 架构、LMCache/NIXL 对比、KV 压缩与稀疏（H2O/SnapKV/DSA） |
+| 3f | [03f-专题-框架横向对比.md](03f-专题-框架横向对比.md) | vLLM / SGLang / TensorRT-LLM / TGI / Dynamo / llama.cpp 选型与面试话术 |
 | 4 | [04-性能与调参.md](04-性能与调参.md) | 指标体系、容量规划三步法、参数调优手册、8 个高频场景配方 |
 | 5 | [05-故障诊断.md](05-故障诊断.md) | 5 分钟定位流程、20 条故障速查、重点故障详解、常态化观测 |
 | 6 | [06-改代码实战.md](06-改代码实战.md) | 源码阅读路线、扩展点矩阵、6 个改造实战、调试工具链、补丁纪律 |

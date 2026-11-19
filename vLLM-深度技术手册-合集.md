@@ -974,7 +974,7 @@ L 层总计 ≈ 4·L·B·S·H 字节
 
 # 第 3 章 核心机制（下）：量化、分离式服务与启动优化
 
-> [← 总览](00-总览.md) ｜ 下一章：[04-性能与调参](04-性能与调参.md)
+> [← 总览](00-总览.md) ｜ 下一章：[03d-专题-FlashAttention演进](03d-专题-FlashAttention演进.md)
 
 ### 3.10 量化：从权重到 KV Cache 的全栈低精度
 
@@ -1165,7 +1165,402 @@ GPU HBM（热，纳秒级）
 
 ---
 
-> 上一篇：[03b-核心机制-执行与并行](03b-核心机制-执行与并行.md) ｜ [返回总览](00-总览.md) ｜ 下一篇：[04-性能与调参](04-性能与调参.md)
+> 上一篇：[03b-核心机制-执行与并行](03b-核心机制-执行与并行.md) ｜ [返回总览](00-总览.md) ｜ 下一篇：[03d-专题-FlashAttention演进](03d-专题-FlashAttention演进.md)
+
+
+# 第 3 章 专题 A：FlashAttention 演进与 Attention 内核
+
+> [← 总览](00-总览.md) ｜ 下一章：[03e-专题-KV池化与Mooncake](03e-专题-KV池化与Mooncake.md)
+
+### 3d.1 先说结论：为什么 attention 内核值得单独一章
+
+- **它是唯一同时被"形状、精度、硬件、KV 布局"四重约束的算子**：prefill 是长 query 的因果矩阵乘，decode 是 q_len=1 的"读 KV"操作，两者最优 kernel 完全不同。
+- **它决定了 decode 的下限**：decode 阶段 80% 的时间在搬 KV，attention kernel 的访存效率直接换算成 TPOT。
+- **它是最容易"选错还不报错"的地方**：同一份权重，backend 选错可能慢 2×，也可能精度悄悄退化。
+
+一句话：**PagedAttention 决定"KV 存在哪、怎么找"，FlashAttention 决定"找到之后怎么算得快"**，两者正交，必须分开理解。
+
+### 3d.2 问题的本质：标准 attention 是 IO-bound
+
+朴素的 `softmax(QKᵀ)V` 在 GPU 上会经历：
+
+```
+① 算 S = QKᵀ        → 写 N×N 矩阵到 HBM（N=序列长度）
+② 读 S，做 softmax  → 再写回 N×N
+③ 读 S，乘 V        → 再读一次 N×N
+```
+
+**三次 N² 级别的 HBM 读写**。当 N=8K、head_dim=128、BF16 时，单个 head 的 S 矩阵就是 128 MB；GPU 的 HBM 带宽（~3 TB/s）看起来很高，但 N² 的增长会让 attention 变成**纯带宽问题**——这就是 flash attention 系列解决的核心矛盾。
+
+**FlashAttention 的三板斧**（四代都没变）：
+
+1. **Tiling（分块）**：把 Q/K/V 切成能放进 SRAM 的小块，块内完成计算。
+2. **Online softmax（在线归一化）**：不等整行算完，边算边维护 `(max, sum)`，用 rescale 修正历史结果。
+3. **Recompute（重计算）**：反向传播不存 N×N 的中间结果，用 O(N) 的统计量重算，显存从 O(N²) 降到 O(N)。
+
+### 3d.3 四代演进：差异到底在哪
+
+| 代际 | 时间 | 目标硬件 | 核心改进 | 相对收益（官方/论文口径） | 关键限制 |
+|---|---|---|---|---|---|
+| **FA1** | 2022 | Ampere（A100） | 分块 + online softmax + 重计算，彻底不落地 N×N | 比 PyTorch 2–4×，显存 O(N) | 仅前向；并行度不足；非 matmul 开销占比高 |
+| **FA2** | 2023 | Ampere / Ada | ① 减少非 matmul FLOPs（延迟 rescale）；② 沿**序列维**并行；③ causal mask 跳过整块；④ 支持 head_dim 256 | 约 2× FA1，可达 A100 峰值的 50–73% | 仍是"每 head 独立"的并行；Hopper 新指令没用上 |
+| **FA3** | 2024 | **Hopper（H100/H200）** | ① TMA（异步张量搬运）；② WGMMA（warpgroup 级矩阵乘）；③ **warp specialization**（生产者/消费者分工）；④ FP8；⑤ 更好的 varlen | 约 1.5–2× FA2 | 强绑定 Hopper；移植性差；早期 paged KV 支持不完整 |
+| **FA4** | 2025–2026 | **Blackwell（SM100）** | 面向新架构的指令与流水；**paged KV** 与 **head_dim 512（MLA）**；FP8/低精度路径 | 官方口径在 Blackwell 上显著加速（随 shape/精度变化，以 release note 为准） | 新硬件专属；生态仍在补齐 |
+
+> **vLLM 侧的落地事实**（比论文更重要）：0.20 起 **FA4 成为 MLA prefill 默认后端**，支持 head_dim 512 与 paged KV（SM90+）。选型时不要背"FA4 最强"，要看**你的卡、你的 head_dim、你的 KV 布局**是否在支持矩阵里。
+
+#### FA2 相比 FA1 到底改了什么（面试最常问）
+
+1. **不再对每个 block 做一次 rescale**：FA1 在每个 K/V block 后都更新输出；FA2 把 rescale 推迟到"需要时"，减少非 matmul 的逐元素运算——这是 2× 加速的主要来源。
+2. **并行维度从 (batch × heads) 扩展到 (batch × heads × 序列块)**：A100 有 108 个 SM，长序列下 FA1 的并行度不够。
+3. **causal mask 的块级跳过**：对角线以上的块直接不算，理论上省一半 FLOPs。
+4. **支持 head_dim 到 256**：适配更多模型结构。
+
+#### FA3 为什么要"warp specialization"
+
+Hopper 上矩阵乘单元（WGMMA）和搬运单元（TMA）是异步的。如果所有 warp 都既搬运又计算，就会出现"等数据"的流水气泡。FA3 把 warp 拆成两类：
+
+```
+producer warp：发 TMA 请求，把 K/V 块搬进 shared memory
+consumer warp：发 WGMMA，算 QKᵀ 与 PV，做 softmax
+两者通过 barrier 同步 → 形成软件流水线（software pipelining）
+```
+
+这是"用架构特性换 1.5–2×"的典型案例，也解释了**为什么 FA3 不能简单移植到别的卡**。
+
+### 3d.4 与 PagedAttention 如何结合
+
+FlashAttention 原生假设 KV 是**连续布局**，而 vLLM 的 KV 是**分页**的。结合点在 kernel 内部：
+
+```
+输入：
+  q            [num_tokens, num_heads, head_dim]
+  k_cache      [num_blocks, block_size, num_kv_heads, head_dim]
+  block_table  [num_reqs, max_blocks]          ← 逻辑块 → 物理块
+  seq_lens     [num_reqs]
+  slot_mapping [num_tokens]                    ← 写入位置
+
+kernel 内：
+  for each kv_block in block_table[req]:
+      k = gather(k_cache, physical_block_id)   ← 间接寻址
+      累加 QKᵀ / online softmax / PV
+```
+
+由此带来四个工程约束（也是高频 bug 来源）：
+
+| 约束 | 后果 |
+|---|---|
+| `block_table` 必须是**每请求独立**的 | 共享前缀时多条请求指向同一物理块，写时要注意 COW/只读 |
+| GQA 下 KV head 被多个 Q head 共享 | kernel 要按 `num_queries_per_kv` 做 head 广播，否则算错 |
+| varlen（变长 batch） | `query_start_loc` 必须严格单调，chunked prefill 下容易错位 |
+| 投机解码的 tree mask | 多 query 的因果 mask 不是简单三角，kernel 需专门支持 |
+
+**为什么 decode 比 prefill 更依赖这些**：prefill 还能靠大矩阵乘摊薄开销，decode 每步只有 1 个 query，**几乎全部时间在按 block_table 随机读 KV**，所以 paged kernel 的 gather 效率、block 大小（0.34 默认 64）、KV 精度（FP8/NVFP4）直接决定 TPOT。
+
+### 3d.5 vLLM 里的内核分工（选型速查）
+
+| 内核 | 强项 | 什么时候选它 | 什么时候别用 |
+|---|---|---|---|
+| **FlashAttention 2/3/4** | 通用 prefill + decode，生态最广 | 默认首选；MLA prefill 用 FA4（SM90+） | 极低延迟 decode（FlashInfer 常更快） |
+| **FlashInfer** | decode 专用优化、JIT 生成、paged/ragged、FP8、Blackwell | 低延迟 decode、Blackwell、需要 FP8 KV | 首次启动要 autotune（可用 `vllm preload --preload-autotune` 预热） |
+| **FlashMLA** | DeepSeek 系 MLA decode，SM90/SM100，fp8_ds_mla | DeepSeek/Qwen-MoE 等 MLA 模型 decode | 非 MLA 模型 |
+| **Triton MLA / Cutlass MLA** | 可移植、可改 | 新卡适配、需要魔改 kernel | 追极致性能 |
+| **Triton Attention** | 能跑、能改 | 没有 FA 的硬件、研究 | 生产（性能一般） |
+| **FlexAttention** | 自定义 mask/稀疏 | 实验性 attention 变体 | 生产默认路径 |
+| **TurboQuant** | 2-bit KV、4× 容量 | 显存极度紧张、可接受精度损失 | 精度敏感任务 |
+
+**排障第一步永远是确认实际后端**：启动日志会打印 `Using ... attention backend`；不要假设配置生效。
+
+### 3d.6 兼容性坑清单
+
+1. **head_dim 不匹配**：FA2 支持到 256，MLA 的 512 需要 FA4/FlashMLA；报错通常是"unsupported head size"。
+2. **FP8 KV 与 kernel**：不是所有 backend 都支持 FP8 KV；混用会 fallback 到慢路径或直接报错。
+3. **chunked prefill**：部分 backend 的 prefix 处理不完整，表现为"长 prompt 结果错乱"，而不是崩溃。
+4. **投机解码**：tree attention 需要 kernel 支持自定义 mask；否则 draft token 的注意力会串。
+5. **滑动窗口/混合模型**：SWA 需要 backend 显式支持（0.26 起成为显式能力），否则窗口外的 KV 会被错误读到。
+
+### 3d.7 性能验证方法
+
+```bash
+# 1) 确认后端与图形
+VLLM_LOGGING_LEVEL=DEBUG vllm serve <m> 2>&1 | grep -i "attention backend\|cudagraph"
+
+# 2) 单 kernel 级对比（隔离调度与框架开销）
+#    固定 batch/seq_len，比较 --enforce-eager 下的 decode 时间
+# 3) 数值对齐：与参考实现比较（BF16 容差 1e-2，FP8 5e-2）
+# 4) 用 nsys 看 attention kernel 占比与 HBM 吞吐
+nsys profile -t cuda,nvtx -o attn vllm serve <m> --enforce-eager
+```
+
+**判断标准**：decode 阶段 attention kernel 若占 step 时间 > 50%，说明是 KV 访存瓶颈——优先查 block 大小、KV 精度、是否命中了正确的 paged kernel，而不是换卡。
+
+### 3d.8 面试追问（速答）
+
+- **FA2 比 FA1 快在哪？** 减少 rescale 次数、序列维并行、causal 块跳过；本质是把"非 matmul 开销"压下去。
+- **FA3 为什么绑定 Hopper？** 依赖 TMA/WGMMA/warp specialization 这些 Hopper 专属能力，其他架构没有等价指令。
+- **PagedAttention 和 FlashAttention 冲突吗？** 不冲突。前者是 KV 的内存布局，后者是计算方式；paged kernel 在内部做 block_table gather。
+- **decode 为什么不用普通 FA？** decode 的 q_len=1，瓶颈是随机读 KV，专用 paged-decode kernel（FlashInfer/FlashMLA）更合适。
+- **MLA 的 attention 特殊在哪？** KV 是压缩 latent，需要先"解压"再算；head_dim 大（512），对 kernel 的 SRAM 与寄存器压力高。
+
+---
+
+> 上一篇：[03c-核心机制-量化与服务化](03c-核心机制-量化与服务化.md) ｜ [返回总览](00-总览.md) ｜ 下一篇：[03e-专题-KV池化与Mooncake](03e-专题-KV池化与Mooncake.md)
+
+
+# 第 3 章 专题 B：KV 池化、Mooncake 与 KV 压缩
+
+> [← 总览](00-总览.md) ｜ 下一章：[03f-专题-框架横向对比](03f-专题-框架横向对比.md)
+
+### 3e.1 为什么 KV 要"池化"
+
+KV Cache 是推理系统里**最贵、最可复用、也最难管理**的资源。单机视角下它只是显存；集群视角下它有三个结构性浪费：
+
+| 浪费 | 现象 | 量化（经验值） |
+|---|---|---|
+| **跨实例重复** | 同一份 system prompt / 文档在 8 个副本上各算一遍 | 命中率每提升 10pt，prefill 算力省 ~10% |
+| **跨请求重复** | 多轮对话每轮重算历史 | 第 10 轮时 90% 的 token 是重复的 |
+| **时间维度浪费** | 昨天算过的长文档，今天冷启动又要重算 | 长文档 RAG 的 TTFT 主要花在这 |
+
+把 KV 从"某个 GPU 的私有内存"提升为**集群级可寻址的缓存**（池化），就是 Mooncake / LMCache / NIXL 这类系统的共同目标。它解决的不是"算得快"，而是"**不用重算**"。
+
+### 3e.2 Mooncake 架构
+
+Mooncake 是月之暗面（Moonshot AI）提出的 **KVCache 为中心的分离式架构**，论文标题即 *A KVCache-centric Disaggregated Architecture for LLM Serving*。核心思想：**把 KV Cache 当作一等存储资源来调度**，而不是推理的副产品。
+
+#### 组件
+
+| 组件 | 职责 | 关键设计 |
+|---|---|---|
+| **Conductor** | 全局请求调度 | 感知 KV 缓存位置与负载，决定"发到哪个 prefill / decode 实例" |
+| **KVCache Pool** | 分层缓存（GPU / CPU DRAM / SSD） | 按块管理，支持跨实例共享与淘汰 |
+| **Transfer Engine** | KV 高速传输 | 多协议（RDMA / NVLink / TCP）、多网卡聚合、零拷贝、批量传输 |
+| **Master** | 元数据与路由 | 记录"哪个块在哪个节点"，提供全局视图 |
+
+#### 两种工作模式
+
+```
+① P2P（点对点）：Prefill 实例算完 → 直接 RDMA 推给指定 Decode 实例
+   优点：路径最短、延迟最低；缺点：需要调度器精确配对
+
+② Store（共享池）：Prefill 写入 KVCache Pool → Decode 按需拉取
+   优点：解耦、可复用、支持多消费者；缺点：多一跳、池容量与带宽成为瓶颈
+```
+
+#### 请求流（Store 模式）
+
+```
+Client → Conductor
+   ├─ 查 Master：这段前缀的 KV 在池里吗？
+   │     ├─ 命中 → 直接把请求发给持有该 KV 的 Decode 实例（跳过 prefill）
+   │     └─ 未命中 → 发到 Prefill 实例算 KV → 写入 Pool → Decode 拉取
+   └─ 返回流式结果
+```
+
+#### 收益口径（论文/官方，随负载变化）
+
+- 在 Kimi 的真实负载上，相比基线系统**吞吐最高提升约 5×**（论文口径 525%）；
+- 在满足 SLO 的前提下**可多服务约 75% 的请求**；
+- 核心来源：**长上下文请求的 prefill 被大量跳过**，以及 P/D 资源按瓶颈独立扩缩。
+
+> 注意：这些数字强依赖"前缀重复度"和"网络带宽"。前缀重复度低（开放域聊天）时收益会大幅缩水——这也是评估 PD/池化方案时最容易踩的坑。
+
+### 3e.3 在 vLLM 里怎么接
+
+vLLM 通过 **KV Connector** 抽象接入外部 KV 系统（接口见 §6.7），Mooncake 相关有三条路径：
+
+| 路径 | 用途 | 配置形态（示意，以你的版本为准） |
+|---|---|---|
+| **MooncakeConnector（P2P）** | P/D 分离的点对点传输 | `--kv-transfer-config '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer/kv_consumer"}'` |
+| **MooncakeStore** | 写入共享 KVCache 池，跨实例复用 | connector 指向 Store 地址，配合 prefix-aware 路由 |
+| **Mooncake 磁盘卸载** | 把冷 KV 下沉到 SSD（0.22+） | 作为多级 offload 的二级存储实现 |
+
+**最小可用拓扑**（单机验证）：
+
+```
+P 实例（--kv-role producer） ──RDMA──> D 实例（--kv-role consumer）
+        │                                   ▲
+        └────── Mooncake Store（可选）──────┘
+```
+
+**验收要点**：
+
+1. KV 传输失败能**回退到本地重算**（0.25+ 有 KV Load Failure Recovery 测试用例可参考）；
+2. 逐层流水传输，而不是等整个 prefill 结束再传；
+3. 全局前缀命中的 token 数与路由决策一致（否则会出现"路由到 A、KV 在 B"的抖动）。
+
+### 3e.4 同类方案对比
+
+| 方案 | 定位 | 传输 | 缓存层 | 与 vLLM 关系 | 适合 |
+|---|---|---|---|---|---|
+| **Mooncake** | KVCache 中心化 + PD 分离 | 自研 Transfer Engine（RDMA/NVLink） | GPU/DRAM/SSD 分层池 | Connector + Store + 磁盘卸载 | 自建大规模集群、长上下文 |
+| **LMCache** | 独立 KV 缓存层 | 多种后端（本地/Redis/S3/Mooncake） | CPU/磁盘/远端 | 官方 connector，集成度高 | 想快速加"KV 缓存服务" |
+| **NIXL** | 通用传输库（NVIDIA） | RDMA/NVLink/GDS | 不管缓存，只负责搬 | Dynamo/llm-d 的底座 | 自研编排层 |
+| **FlexKV** | 灵活 KV 连接（0.25 示例） | 可插拔 | 可插拔 | 示例级 | 学习与定制 |
+| **vLLM 原生 KV Offload** | 单机分层 | PCIe/NVMe | GPU→CPU→磁盘 | 内建（0.18/0.22+） | 单机长会话、不想引入外部组件 |
+
+**选型直觉**：单机先试原生 offload；多实例共享前缀上 LMCache（接入最快）；要做 P/D + 全局池化且有 RDMA 集群，再上 Mooncake。
+
+### 3e.5 全局前缀缓存与路由
+
+池化之后，**"把请求发到谁"比"算得多快"更重要**。前缀感知路由的核心：
+
+```
+对每个请求：
+  1. 取 prompt 的块级哈希序列（与 §3.3 一致）
+  2. 在路由表中查"哪些实例/池持有这些块"
+  3. 选命中块数最多的目标（tie-break 用负载）
+  4. 预测命中长度 → 决定是否值得跨机传输（传输时间 vs 重算时间）
+```
+
+**命中率的三层影响因素**：
+
+| 层 | 因素 | 优化 |
+|---|---|---|
+| 前缀本身 | system prompt 是否稳定、模板是否带随机量 | 模板工程（§4.4 场景 A） |
+| 缓存容量 | 池大小、淘汰策略、块粒度 | 分层存储、partial block caching |
+| 路由质量 | 是否前缀感知、是否抖动 | 一致性哈希 + 负载感知，避免"路由漂移" |
+
+**关键判断式**（决定"传还是算"）：
+
+```
+传输收益 = 跳过的 prefill 时间 − (KV 字节 / 有效带宽)
+若为负 → 不要传，本地重算更便宜
+```
+
+### 3e.6 容量与收益模型
+
+```
+单请求 KV 字节 = prompt_tokens × per_token_bytes          （§3.1.2）
+池命中可省算力 ≈ 命中的 prompt_tokens × 2 × 参数量 FLOPs
+池所需容量 ≈ 活跃前缀数 × 平均前缀长度 × per_token_bytes × 副本系数
+
+例：32B 模型、4 卡 TP、平均前缀 8K、活跃前缀 2000 条
+  per_token ≈ 40 KB（见 §3.1.2 例）→ 单份 8K ≈ 320 MB
+  2000 × 320 MB ≈ 640 GB  → 必须分层（DRAM/SSD），不能全放显存
+```
+
+**成本账**：
+
+- 池化的存储成本（DRAM/SSD）远低于 GPU 显存；
+- 但**传输带宽**是硬约束：100 Gbps 下 2.5 GB 的 KV 要 0.2 s（§3.11.3），所以池化只对"大前缀 + 高复用"划算。
+
+### 3e.7 KV 压缩与稀疏：另一条省显存的路
+
+池化解决"放不下"，压缩解决"装更多"。三类手段要分清：
+
+| 类别 | 代表方法 | 保留什么 | 收益 | 代价 | vLLM 主线对应 |
+|---|---|---|---|---|---|
+| **驱逐/稀疏选择** | StreamingLLM、H2O、SnapKV、Quest | 一部分 token 的 KV | 显存 ↓、decode 带宽 ↓ | 长程召回损失，需评估 | 主线未内置（DSA 除外），多用于研究/定制 |
+| **稀疏注意力（模型侧）** | DeepSeek **DSA**（V3.2-Exp 起） | indexer 选 top-k token | 长上下文算力大幅下降 | 依赖模型训练，kernel 复杂 | 稀疏 MLA 后端已支持 |
+| **量化** | FP8 KV、NVFP4 KV、**TurboQuant 2-bit** | 全部 KV，但更低精度 | 容量 ×2 / ×4 | 精度衰减（长文最敏感） | 内建，`--kv-cache-dtype` |
+| **分层卸载** | KV Offload、**HiSparse** | 全部 KV，但不在显存 | 等效容量 ↑ | 延迟 ↑、带宽依赖 | 内建（0.18–0.30） |
+
+**各方法的要点**：
+
+- **StreamingLLM**：保留开头几个"attention sink" + 最近窗口，显存恒定；适合无限流式对话，但会忘掉中间内容。
+- **H2O**：按累计注意力分数保留"heavy hitters"，约 20% 预算可维持多数任务质量。
+- **SnapKV**：在 prompt 末尾开"观察窗口"，按 head 选出重要 KV 再压缩；偏 prefill 侧压缩。
+- **Quest**：query-aware 的**页级** top-k 选择（与 vLLM 的 block 天然契合），是"稀疏 + 分页"的代表。
+- **DSA**：模型自带稀疏注意力（lightning indexer + top-k），推理时只需算被选中的 token；这是 2026 年长上下文的主流路线之一。
+- **TurboQuant**：不是驱逐而是量化到 2-bit，容量 ×4，适合"显存极度紧张 + 可接受精度损失"。
+
+> **面试提醒**：不要把这些混为一谈。**驱逐会丢信息（不可逆），量化只是加噪声（可评估），卸载只是换介质（延迟换容量）**。
+
+### 3e.8 落地 checklist 与坑
+
+```text
+[ ] 先量化收益：前缀重复度、平均长度、跨实例重合率（没有数据不要上池化）
+[ ] 传输带宽实测：RDMA/NVLink 的 all-to-all 与 P2P 基线（§3.9.2）
+[ ] 失败回退：KV 拉取失败能否本地重算（否则一次抖动 = 一批请求失败）
+[ ] 一致性：块哈希要含 tokenizer/模板/模型版本（§3.3.1），跨实例必须同构
+[ ] 隔离：多租户必须 cache_salt，池化会放大侧信道风险
+[ ] 淘汰策略：池是全局 LRU 还是按租户配额？防止一个大租户冲掉所有人
+[ ] 观测：命中率、传输字节/耗时、回退率、P/D 各自利用率
+```
+
+**高频坑**：
+
+1. **拓扑不一致**：P 用 TP=8、D 用 TP=4，KV 分片方式不同，直接算错——必须同构或显式重分片。
+2. **版本漂移**：P 与 D 的 vLLM 版本不同，KV 布局/量化格式变化 → 脏读。
+3. **路由抖动**：请求在实例间反复漂移，命中率反而低于不池化。
+4. **传输打满网卡**：KV 传输与 NCCL 抢带宽，导致 TPOT 抖动（要给 RDMA 做 QoS/分平面）。
+
+### 3e.9 面试速答
+
+- **Mooncake 的核心创新？** 把 KVCache 当作集群级存储来调度（Conductor + Pool + Transfer Engine），让长上下文请求跳过 prefill。
+- **池化一定更快吗？** 不一定，取决于前缀重复度与传输带宽；短 prompt 或低重复场景不划算。
+- **KV 压缩和 KV 量化区别？** 压缩（驱逐/稀疏）丢 token 信息，量化只降精度；前者不可逆，后者可评估。
+- **为什么 DSA 类稀疏注意力这两年重要？** 长上下文下 attention 是 O(N²)，稀疏化把计算降到"选中 token"级别，是模型与 kernel 协同设计的方向。
+
+---
+
+> 上一篇：[03d-专题-FlashAttention演进](03d-专题-FlashAttention演进.md) ｜ [返回总览](00-总览.md) ｜ 下一篇：[03f-专题-框架横向对比](03f-专题-框架横向对比.md)
+
+
+# 第 3 章 专题 C：推理框架横向对比与选型
+
+> [← 总览](00-总览.md) ｜ 下一章：[04-性能与调参](04-性能与调参.md)
+
+### 3f.1 一张表看清定位
+
+| 框架 | 定位 | 核心设计 | 硬件 | 模型覆盖 | 上手成本 | 典型场景 |
+|---|---|---|---|---|---|---|
+| **vLLM** | 通用推理引擎 + 平台底座 | PagedAttention → V1 引擎 → 插件化（平台/后端/连接器） | 最广（NVIDIA/AMD/Intel/TPU/国产卡插件） | 200+ 架构 | 低 | 自建推理平台、多模型、多硬件 |
+| **SGLang** | 高性能 serving + 前端 DSL | **RadixAttention**（基数树前缀缓存）、前后端一体 | NVIDIA/AMD | 主流模型 | 中 | 高并发共享前缀、结构化输出密集 |
+| **TensorRT-LLM** | 编译式极致性能 | 预先构建 engine、in-flight batching、融合 kernel | 仅 NVIDIA | 滞后于社区 | 高 | 固定模型、追求单机极限、可接受定制 |
+| **TGI** | HF 生态 serving | Rust router + Python 后端、连续批处理 | NVIDIA/AMD/CPU | 跟随 HF | 低 | 快速上线、HF 生态集成 |
+| **Dynamo / llm-d** | 编排层（不是引擎） | KV 感知路由、P/D 分离、多后端调度 | 不限 | 取决于后端 | 中 | 集群级调度、多引擎混部 |
+| **llama.cpp / Ollama** | 本地/边缘 | GGUF 量化、CPU/Metal 后端 | CPU/Apple/低端 GPU | 广但浅 | 极低 | 本地开发、隐私场景 |
+
+### 3f.2 设计哲学差异（面试加分项）
+
+**vLLM：把"内存管理 + 调度"做成可复用的底座。**
+它的护城河不是某个 kernel，而是 **PagedAttention 抽象 + V1 调度架构 + 插件体系**。所以它能同时支持 6 种硬件、200+ 模型、PD 分离、多级 KV——代价是"什么都能做，但单点不一定最快"。
+
+**SGLang：把"前缀复用"做到极致。**
+RadixAttention 用基数树管理 KV 前缀，天然支持"多轮对话/多分支采样/共享 system prompt"，配合前端 DSL 能把"生成 + 解析 + 分支"编排得很紧凑。**前缀重复度高的负载上它常领先**；但生态广度不如 vLLM。
+
+**TensorRT-LLM：把"编译期优化"做到极致。**
+Engine 在部署前构建，能做图层面的融合、精度选择、kernel 特化，**单机吞吐上限最高**。代价是：模型支持滞后、改模型要重建、调试困难、强绑定 NVIDIA。适合"模型固定、流量巨大、团队有专人维护"的场景。
+
+**TGI：把"生态集成"做到极致。**
+HF 模型库 + 简单部署是它的价值；性能不是第一目标。
+
+**Dynamo / llm-d：把"集群编排"从引擎里拆出来。**
+它们不训练/不推理，只做路由、P/D 编排、KV 感知调度，把 vLLM/SGLang/TRT-LLM 当后端。这反映了 2026 年的一个趋势：**引擎与编排分层**。
+
+### 3f.3 选型决策树
+
+```
+① 是否只跑 NVIDIA 且模型固定、追求单机极限？
+   ├─ 是 → TensorRT-LLM（接受维护成本）
+   └─ 否 ↓
+② 是否本地/边缘/无 GPU 集群？
+   ├─ 是 → Ollama / llama.cpp
+   └─ 否 ↓
+③ 负载是否高度共享前缀（多轮、Agent、固定知识库）？
+   ├─ 是 → SGLang 优先评估；也可 vLLM + 前缀缓存 + 池化
+   └─ 否 ↓
+④ 是否需要多硬件/国产卡、PD 分离、复杂插件？
+   ├─ 是 → vLLM（+ Dynamo/llm-d 做编排）
+   └─ 否 → vLLM 或 SGLang 均可，按团队栈选
+```
+
+### 3f.4 面试怎么答（避免踩雷）
+
+**不要回答"XX 最快"**，要回答**在什么条件下快、代价是什么**：
+
+> "vLLM 的优势是抽象与生态：PagedAttention 的块管理和 V1 调度让它能覆盖多硬件、多模型、P/D 与多级 KV；代价是单点性能不一定最优。SGLang 的 RadixAttention 在共享前缀场景命中率更高，前端 DSL 对多轮/结构化输出更友好。TensorRT-LLM 编译式优化能拿到单机上限，但模型支持滞后、定制成本高。生产上常见的是 vLLM 做底座 + Dynamo/llm-d 做编排。"
+
+**追问准备**：
+
+- "为什么 vLLM 不做编译式？" → 它选择运行时编译（torch.compile）+ 插件化 kernel，换取模型覆盖与硬件可移植性。
+- "RadixAttention 和 vLLM 的 prefix caching 区别？" → 数据结构不同（基数树 vs 块哈希表），前者对"部分匹配/分叉"更自然，后者对"固定块 + 分布式共享"更简单。
+- "能混用吗？" → 能，编排层可以把不同引擎当后端，按模型/负载路由。
+
+---
+
+> 上一篇：[03e-专题-KV池化与Mooncake](03e-专题-KV池化与Mooncake.md) ｜ [返回总览](00-总览.md) ｜ 下一篇：[04-性能与调参](04-性能与调参.md)
 
 
 # 第 4 章 性能模型、容量规划与调参
@@ -1416,7 +1811,7 @@ vllm serve Qwen3-32B --max-num-seqs 1024 --max-num-batched-tokens 32768 \
 
 ---
 
-> 上一篇：[03c-核心机制-量化与服务化](03c-核心机制-量化与服务化.md) ｜ [返回总览](00-总览.md) ｜ 下一篇：[05-故障诊断](05-故障诊断.md)
+> 上一篇：[03f-专题-框架横向对比](03f-专题-框架横向对比.md) ｜ [返回总览](00-总览.md) ｜ 下一篇：[05-故障诊断](05-故障诊断.md)
 
 
 # 第 5 章 线上问题诊断手册
